@@ -1,100 +1,87 @@
+# encoding: utf-8
+#
 $: << File.realpath(File.join(File.dirname(__FILE__), "..", "lib"))
-require "tempfile"
+require "json"
 require "lumberjack/server"
-require "insist"
 require "stud/try"
+require "stud/temporary"
 
 describe "lumberjack" do
-  before :each do
-    # TODO(sissel): Generate a self-signed SSL cert
-    @file = Stud::Temporary.file("lumberjack-test-file")
-    @ssl_cert = Stud::Temporary.file("lumberjack-test-file")
-    @ssl_key = Stud::Temporary.file("lumberjack-test-file")
-    @ssl_csr = Stud::Temporary.file("lumberjack-test-file")
+  let(:ssl_certificate) { Stud::Temporary.pathname("ssl_certificate") }
+  let(:ssl_key) { Stud::Temporary.pathname("ssl_key") }
+  let(:config_file) { Stud::Temporary.pathname("config_file") }
+  let(:input_file) { Stud::Temporary.pathname("input_file") }
 
-    # Generate the ssl key
-    system("openssl genrsa -out #{@ssl_key.path} 1024")
-    system("openssl req -new -key #{@ssl_key.path} -batch -out #{@ssl_csr.path}")
-    system("openssl x509 -req -days 365 -in #{@ssl_csr.path} -signkey #{@ssl_key.path} -out #{@ssl_cert.path}")
+  let(:lsf) do
+    # Start the process, return the pid
+    IO.popen(["./logstash-forwarder", "-config", config_file])
+  end
 
-    @server = Lumberjack::Server.new(
-      :ssl_certificate => @ssl_cert.path,
-      :ssl_key => @ssl_key.path
-    )
-    @lumberjack = IO.popen("build/bin/lumberjack --host localhost " \
-                           "--port #{@server.port} " \
-                           "--ssl-ca-path #{@ssl_cert.path} #{@file.path}",
-                           "r")
+  let(:random_field) { (rand(30)+1).times.map { (rand(26) + 97).chr }.join }
+  let(:random_value) { (rand(30)+1).times.map { (rand(26) + 97).chr }.join }
 
-    @event_queue = Queue.new
-    @server_thread = Thread.new do
-      @server.run do |event|
-        @event_queue << event
+  let(:server) do 
+    Lumberjack::Server.new(:ssl_certificate => ssl_certificate, :ssl_key => ssl_key)
+  end
+  let(:queue) { Queue.new }
+
+  let(:server_thread) do
+    Thread.new(queue) do |q| 
+      begin
+        server.run { |e| q << e }
+      rescue => e
+        puts "Lumberjack::Server failed: #{e}"
+        puts e.backtrace
+        raise e
       end
     end
+  end
+
+  let(:logstash_forwarder_config) do
+    <<-CONFIG
+    {
+      "network": {
+        "servers": [ "localhost:5043" ],
+        "ssl ca": "#{ssl_certificate}"
+      },
+      "files": [
+        {
+          "paths": [ "#{input_file}", ],
+          "fields": { #{random_field.to_json}: #{random_value.to_json} }
+        }
+      ]
+    }
+    CONFIG
+  end
+
+  after do
+    [ssl_certificate, ssl_key, config_file].each do |path|
+      File.unlink(path) if File.exists?(path)
+    end
+    Process::kill("KILL", lsf.pid)
+    Process::wait(lsf.pid)
+  end
+
+  before do
+    system("openssl req -x509  -batch -nodes -newkey rsa:2048 -keyout #{ssl_key} -out #{ssl_certificate} -subj /CN=localhost > /dev/null 2>&1")
+    
+    lsf
+    server_thread
   end # before each
 
-  after :each do
-    [@file, @ssl_cert, @ssl_key, @ssl_csr].each do |f|
-      f.close
-      File.unlink(f.path)
-    end
-    Process::kill("KILL", @lumberjack.pid)
-    Process::wait(@lumberjack.pid)
-  end
 
   it "should follow a file and emit lines as events" do
-    sleep 1 # let lumberjack start up.
-    count = rand(5000) + 25000
-    count.times do |i|
-      @file.puts("hello #{i}")
-    end
-    @file.close
+    fd = File.new(input_file, "w")
+    fd.write("Hello world\n")
+    fd.flush
+    fd.close
+    p server
+    p lsf.pid
 
-    # Wait for lumberjack to finish publishing data to us.
-    Stud::try(20.times) do
-      raise "have #{@event_queue.size}, want #{count}" if @event_queue.size < count
-    end
 
-    # Now verify that we have all the data and in the correct order.
-    insist { @event_queue.size } == count
-    host = Socket.gethostname
-    count.times do |i|
-      event = @event_queue.pop
-      insist { event["line"] } == "hello #{i}"
-      insist { event["file"] } == @file.path
-      insist { event["host"] } == host
-    end
-    insist { @event_queue }.empty?
+    p queue.pop
   end
 
-  it "should follow a slowly-updating file and emit lines as events" do
-    sleep 5 # let lumberjack start up.
-    count = rand(50) + 1000
-    count.times do |i|
-      @file.puts("fizzle #{i}")
-
-      # Start fast, then go slower after 80% of the events
-      if i > (count * 0.8)
-        sleep(rand * 0.200) # sleep up to 200ms
-      end
-    end
-    @file.close
-
-    # Wait for lumberjack to finish publishing data to us.
-    Stud::try(20.times) do
-      raise "have #{@event_queue.size}, want #{count}" if @event_queue.size < count
-    end
-
-    # Now verify that we have all the data and in the correct order.
-    insist { @event_queue.size } == count
-    host = Socket.gethostname
-    count.times do |i|
-      event = @event_queue.pop
-      insist { event["line"] } == "fizzle #{i}"
-      insist { event["file"] } == @file.path
-      insist { event["host"] } == host
-    end
-    insist { @event_queue }.empty?
-  end
+  it "should follow a slowly-updating file and emit lines as events"
+  it "should support unicode text"
 end
