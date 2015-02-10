@@ -129,13 +129,14 @@ func Publishv1(input chan []*FileEvent,
 
 func connect(config *NetworkConfig) (socket *tls.Conn) {
 	var tlsconfig tls.Config
+	tlsconfig.InsecureSkipVerify = true
 
 	if len(config.SSLCertificate) > 0 && len(config.SSLKey) > 0 {
 		emit("Loading client ssl certificate: %s and %s\n",
 			config.SSLCertificate, config.SSLKey)
 		cert, err := tls.LoadX509KeyPair(config.SSLCertificate, config.SSLKey)
 		if err != nil {
-			fault ("Failed loading client ssl certificate: %s\n", err)
+			fault("Failed loading client ssl certificate: %s\n", err)
 		}
 		tlsconfig.Certificates = []tls.Certificate{cert}
 	}
